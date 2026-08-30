@@ -126,7 +126,7 @@ def principal() -> None:
         "--tribunais", nargs="+",
         default=["trf1", "trf2", "trf3", "trf4", "trf5"],
         choices=["trf1", "trf2", "trf3", "trf4", "trf5"],
-        help="Tribunais a consultar (padrão: os cinco TRFs).",
+        help="Tribunais a consultar (padrão: TRF1 a TRF5).",
     )
     analisador.add_argument(
         "--max-por-tribunal", type=int, default=500,
