@@ -3,4 +3,11 @@ beautifulsoup4>=4.12
 nanojud
 pandas>=2.0
 matplotlib>=3.7
+pytesseract>=0.3.10
+pdf2image>=1.17.0
+transformers>=4.42.0
+torch>=2.3.0
+accelerate>=0.33.0
+sentencepiece>=0.2.0
+huggingface_hub>=0.24.0
 
