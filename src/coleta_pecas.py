@@ -6,6 +6,7 @@ import argparse
 import json
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -99,27 +100,54 @@ def executar_processo(numero: str, destino: Path, limite_inspecao: int) -> dict:
     return criar_manifesto(numero, pasta, extrato)
 
 
+def processar_processo_individual(numero: str, destino: Path, limite_inspecao: int) -> dict:
+    print(f"[{numero}] processando ...", flush=True)
+    try:
+        resultado = executar_processo(numero, destino, limite_inspecao)
+    except (NanoJudError, OSError, ValueError, json.JSONDecodeError) as erro:
+        resultado = {"processo": numero, "erro": str(erro)}
+        print(f"  ERRO: {erro}", file=sys.stderr, flush=True)
+    else:
+        print(f"  {resultado['total_baixados_ou_existentes']} peca(s) baixada(s) ou existente(s)", flush=True)
+    return resultado
+
+
 def principal() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("entrada", type=Path, help="Arquivo JSONL gerado pelo DataJud")
     parser.add_argument("--saida", type=Path, default=Path("dados/baixados"))
     parser.add_argument("--limite-inspecao", type=int, default=0)
+    parser.add_argument("--workers", type=int, default=4, help="Número de workers em paralelo. Cada worker processa um processo completo do início ao fim.")
     args = parser.parse_args()
+
     processos = ler_processos(args.entrada)
     args.saida.mkdir(parents=True, exist_ok=True)
     resumo = {"entrada": str(args.entrada), "total": len(processos), "processos": []}
     caminho_resumo = args.saida / "manifest.json"
-    for indice, numero in enumerate(processos, 1):
-        print(f"[{indice}/{len(processos)}] {numero}", flush=True)
-        try:
-            resultado = executar_processo(numero, args.saida, args.limite_inspecao)
-        except (NanoJudError, OSError, ValueError, json.JSONDecodeError) as erro:
-            resultado = {"processo": numero, "erro": str(erro)}
-            print(f"  ERRO: {erro}", file=sys.stderr, flush=True)
-        else:
-            print(f"  {resultado['total_baixados_ou_existentes']} peca(s) baixada(s) ou existente(s)", flush=True)
-        resumo["processos"].append(resultado)
+
+    if args.workers <= 1:
+        for indice, numero in enumerate(processos, 1):
+            print(f"[{indice}/{len(processos)}] {numero}", flush=True)
+            resultado = processar_processo_individual(numero, args.saida, args.limite_inspecao)
+            resumo["processos"].append(resultado)
+            salvar_json(caminho_resumo, resumo)
         salvar_json(caminho_resumo, resumo)
+        return 0
+
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futuros = {
+            executor.submit(processar_processo_individual, numero, args.saida, args.limite_inspecao): numero
+            for numero in processos
+        }
+
+        for indice, futuro in enumerate(as_completed(futuros), start=1):
+            numero = futuros[futuro]
+            print(f"[processado {indice}/{len(processos)}] {numero}", flush=True)
+            resultado = futuro.result()
+            resumo["processos"].append(resultado)
+            salvar_json(caminho_resumo, resumo)
+
+    salvar_json(caminho_resumo, resumo)
     return 0
 
 
