@@ -32,30 +32,45 @@ Não faça inferências: não considere um procedimento realizado apenas porque 
 Regra de decisão: classifique como 1 quando houver evidências suficientes de aderência; 2 quando houver evidência objetiva de descumprimento ou fragilidade relevante; 3 quando as informações forem insuficientes ou inconclusivas.
 Regra de cautela: a simples ausência de documentação não implica automaticamente classificação 2; quando não for possível determinar se o requisito foi cumprido ou descumprido, classifique como 3.
 Rastreabilidade: baseie a análise exclusivamente nas evidências encontradas nos autos, sem inventar informações ou utilizar fatos externos ao processo.
-Saída obrigatória: responda somente com o número da classificação: 1, 2 ou 3.
+
+Avaliação preliminar das mídias digitais: antes da classificação principal, verifique se existem mídias ou evidências digitais nos autos que se enquadrem no escopo das diretrizes e recomendações do CNJ para tratamento de provas digitais (tais como arquivos eletrônicos, conversas, mensagens, e-mails, registros de sistemas, mídias de armazenamento, capturas de tela, vídeos, áudios, dados extraídos de dispositivos ou serviços digitais). Registre a resposta como "Sim" ou "Não".
+
+Impugnação da prova digital: caso existam mídias digitais enquadradas no item anterior, verifique se há manifestação expressa de qualquer das partes questionando a autenticidade, integridade, origem, autoria, confiabilidade, cadeia de custódia ou veracidade dessas evidências digitais. Considere contestações apresentadas em petições, manifestações, recursos, quesitos, pareceres técnicos ou outros documentos constantes dos autos. Registre a resposta como "Sim" ou "Não". A mera discordância quanto ao mérito dos fatos não deve ser considerada impugnação da prova digital, salvo quando houver questionamento específico sobre a própria evidência ou seu processo de obtenção, preservação ou análise.
 
 Texto do processo: {text[:2000]}
 
-Responda apenas o número da categoria:"""
+Saída obrigatória:
+MIDIAS_DIGITAIS: Sim ou Não
+IMPUGNACAO_DA_PROVA_DIGITAL: Sim ou Não
+CLASSIFICACAO: 1, 2 ou 3"""
     
     messages = [{"role": "user", "content": prompt}]
-    result = pipe(prompt, max_new_tokens=2, num_return_sequences=1, do_sample=False)
+    # Increase max_new_tokens to allow for the three lines of output (Sim/Não, Sim/Não, 1/2/3)
+    result = pipe(prompt, max_new_tokens=50, num_return_sequences=1, do_sample=False)
     generated_text = result[0]['generated_text']
-    classification = generated_text.strip()[-1] 
-    if classification.isdigit():
-        return classification
-    else:
-        for char in generated_text:
-            if char.isdigit():
-                return char
-        return "3"
+    
+    # Parse the output, initializing to None for NULL fallback
+    media_digital = None
+    impugnacao_digital = None
+    classification = None
+
+    # Extract values based on the expected format
+    for line in generated_text.split('\n'):
+        if "MIDIAS_DIGITAIS:" in line:
+            media_digital = line.split("MIDIAS_DIGITAIS:")[1].strip()
+        elif "IMPUGNACAO_DA_PROVA_DIGITAL:" in line:
+            impugnacao_digital = line.split("IMPUGNACAO_DA_PROVA_DIGITAL:")[1].strip()
+        elif "CLASSIFICACAO:" in line:
+            classification = line.split("CLASSIFICACAO:")[1].strip()
+
+    return media_digital, impugnacao_digital, classification
 
 
-# 3. Folder and File Classification
+# 2. Folder and File Classification
 root_folder = '/content/drive/MyDrive/ocr_export'
 output_csv_path = '/content/drive/MyDrive/process_classification_results.csv'
 
-batch_size = 100  # Define batch size
+batch_size = 10  # Define batch size
 
 # Ensure root folder exists
 if not os.path.exists(root_folder):
@@ -97,19 +112,32 @@ else:
             full_process_text = "\n".join(combined_text)
             
             if full_process_text:
-                classification = classify_process_text(full_process_text)
-                batch_results.append({"Process ID": process_folder_name, "Classification": classification})
-                print(f"  Process: {process_folder_name} | Classification: {classification}")
+                media_digital, impugnacao_digital, classification = classify_process_text(full_process_text)
+                batch_results.append({
+                    "Process ID": process_folder_name,
+                    "MIDIAS_DIGITAIS": media_digital,
+                    "IMPUGNACAO_DA_PROVA_DIGITAL": impugnacao_digital,
+                    "CLASSIFICACAO": classification
+                })
+                print(f"  Process: {process_folder_name} | MIDIAS_DIGITAIS: {media_digital} | IMPUGNACAO_DA_PROVA_DIGITAL: {impugnacao_digital} | CLASSIFICACAO: {classification}")
             else:
-                batch_results.append({"Process ID": process_folder_name, "Classification": "3"}) # Can't determine if no text
-                print(f"  Process {process_folder_name} has no content to classify. Classified as '3'.")
+                # If no text, set all values to None
+                batch_results.append({
+                    "Process ID": process_folder_name,
+                    "MIDIAS_DIGITAIS": None,
+                    "IMPUGNACAO_DA_PROVA_DIGITAL": None,
+                    "CLASSIFICACAO": None
+                }) 
+                print(f"  Process {process_folder_name} has no content to classify. Values set to NULL.")
 
         # Append batch results to CSV
         if batch_results:
             batch_df = pd.DataFrame(batch_results)
-            if not os.path.exists(output_csv_path):
+            if not os.path.exists(output_csv_path) or existing_results_df.empty:
+                # If CSV doesn't exist or was empty, write with header
                 batch_df.to_csv(output_csv_path, index=False, mode='w')
             else:
+                # If CSV exists and had data, append without header
                 batch_df.to_csv(output_csv_path, index=False, mode='a', header=False)
             print(f"  Batch results saved/appended to {output_csv_path}")
         else:
