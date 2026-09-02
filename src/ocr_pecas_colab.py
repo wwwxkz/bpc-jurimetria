@@ -23,11 +23,75 @@ import argparse
 import json
 import re
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 import pytesseract
 from pdf2image import convert_from_path
+
+def _processo_worker(
+    processo_id: str,
+    pdf_paths: list[str],
+    output_dir: str,
+    dpi: int,
+    lang: str,
+) -> list[dict[str, Any]]:
+    output_dir_path = Path(output_dir)
+
+    pasta_processo = output_dir_path / f"process_{processo_id}"
+    pasta_processo.mkdir(parents=True, exist_ok=True)
+
+    manifest_local: list[dict[str, Any]] = []
+
+    total = len(pdf_paths)
+
+    for indice_peca, pdf_str in enumerate(pdf_paths, start=1):
+        pdf_path = Path(pdf_str)
+
+        print(
+            f"[{processo_id}] {indice_peca}/{total} {pdf_path.name}",
+            flush=True,
+        )
+
+        paginas = extrair_texto_pdf(
+            pdf_path,
+            dpi=dpi,
+            lang=lang,
+        )
+
+        texto_final = "\n\n".join(paginas)
+
+        nome_slug = sanitizar_nome(pdf_path.stem)
+
+        nome_arquivo = (
+            f"piece_{indice_peca:04d}_{nome_slug}.txt"
+        )
+
+        destino = pasta_processo / nome_arquivo
+
+        destino.write_text(
+            texto_final,
+            encoding="utf-8",
+        )
+
+        manifest_local.append(
+            {
+                "processo_id": processo_id,
+                "processo_folder": f"process_{processo_id}",
+                "piece_index": indice_peca,
+                "piece_file": nome_arquivo,
+                "piece_source_pdf": str(pdf_path),
+                "source_pdf_name": pdf_path.name,
+                "ocr_output_txt": str(
+                    destino.relative_to(output_dir_path)
+                ),
+                "num_paginas": len(paginas),
+                "num_caracteres": len(texto_final),
+            }
+        )
+
+    return manifest_local
 
 def sanitizar_nome(texto: str) -> str:
     texto = texto.strip().lower()
@@ -66,51 +130,113 @@ def extrair_texto_pdf(pdf_path: Path, dpi: int = 300, lang: str = "por") -> list
 
     return paginas
 
+def exportar_pecas(
+    input_dir: Path,
+    output_dir: Path,
+    dpi: int = 300,
+    lang: str = "por",
+    workers: int | None = None,
+) -> dict[str, Any]:
 
-def exportar_pecas(input_dir: Path, output_dir: Path, dpi: int = 300, lang: str = "por") -> dict[str, Any]:
     pdfs = descobrir_pdf_paths(input_dir)
+
     if not pdfs:
-        raise FileNotFoundError(f"Nenhum PDF de peça encontrado em: {input_dir}")
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    manifest: list[dict[str, Any]] = []
-    contador_por_processo: dict[str, int] = defaultdict(int)
-
-    for pdf_path in pdfs:
-        processo_id = pdf_path.parent.parent.name
-        contador_por_processo[processo_id] += 1
-        indice_peca = contador_por_processo[processo_id]
-
-        nome_base = pdf_path.stem
-        nome_slug = sanitizar_nome(nome_base)
-        pasta_processo = output_dir / f"process_{processo_id}"
-        pasta_processo.mkdir(parents=True, exist_ok=True)
-
-        nome_arquivo = f"piece_{indice_peca:04d}_{nome_slug}.txt"
-        destino = pasta_processo / nome_arquivo
-
-        paginas = extrair_texto_pdf(pdf_path, dpi=dpi, lang=lang)
-        texto_final = "\n\n".join(paginas)
-        destino.write_text(texto_final, encoding="utf-8")
-
-        manifest.append(
-            {
-                "processo_id": processo_id,
-                "processo_folder": f"process_{processo_id}",
-                "piece_index": indice_peca,
-                "piece_file": nome_arquivo,
-                "piece_source_pdf": str(pdf_path),
-                "source_pdf_name": pdf_path.name,
-                "ocr_output_txt": str(destino.relative_to(output_dir)),
-                "num_paginas": len(paginas),
-                "num_caracteres": len(texto_final),
-            }
+        raise FileNotFoundError(
+            f"Nenhum PDF de peça encontrado em: {input_dir}"
         )
 
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    workers = max(1, workers or 4)
+
+    processos: dict[str, list[Path]] = defaultdict(list)
+
+    for pdf in pdfs:
+        processo_id = pdf.parent.parent.name
+        processos[processo_id].append(pdf)
+
+    manifest: list[dict[str, Any]] = []
+
+    if workers == 1:
+
+        for processo_id, pdfs_processo in processos.items():
+
+            manifest.extend(
+                _processo_worker(
+                    processo_id=processo_id,
+                    pdf_paths=[
+                        str(p) for p in pdfs_processo
+                    ],
+                    output_dir=str(output_dir),
+                    dpi=dpi,
+                    lang=lang,
+                )
+            )
+
+    else:
+
+        with ProcessPoolExecutor(
+            max_workers=workers
+        ) as executor:
+
+            futures = {
+                executor.submit(
+                    _processo_worker,
+                    processo_id,
+                    [str(p) for p in pdfs_processo],
+                    str(output_dir),
+                    dpi,
+                    lang,
+                ): processo_id
+                for processo_id, pdfs_processo
+                in processos.items()
+            }
+
+            for future in as_completed(futures):
+
+                processo_id = futures[future]
+
+                try:
+                    manifest.extend(
+                        future.result()
+                    )
+
+                    print(
+                        f"[OK] Processo {processo_id}",
+                        flush=True,
+                    )
+
+                except Exception as exc:
+
+                    print(
+                        f"[ERRO] Processo {processo_id}: {exc}",
+                        flush=True,
+                    )
+                    raise
+
+    manifest.sort(
+        key=lambda item: (
+            item["processo_id"],
+            item["piece_index"],
+        )
+    )
+
     manifest_path = output_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    manifest_path.write_text(
+        json.dumps(
+            manifest,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     readme = output_dir / "README.md"
+
     readme.write_text(
         "# OCR das peças dos processos\n\n"
         "Esta pasta foi gerada com o script `ocr_pecas_colab.py`.\n\n"
@@ -122,12 +248,11 @@ def exportar_pecas(input_dir: Path, output_dir: Path, dpi: int = 300, lang: str 
     )
 
     return {
-        "total_processos": len({item["processo_id"] for item in manifest}),
+        "total_processos": len(processos),
         "total_pecas": len(manifest),
         "output_dir": str(output_dir),
         "manifest": str(manifest_path),
     }
-
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -156,9 +281,15 @@ def main() -> int:
         default="por",
         help="Idioma do Tesseract para OCR (padrão: por).",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Número de threads paralelas para OCR. Se não informado, usa 4.",
+    )
     args = parser.parse_args()
 
-    resumo = exportar_pecas(args.input, args.output, dpi=args.dpi, lang=args.lang)
+    resumo = exportar_pecas(args.input, args.output, dpi=args.dpi, lang=args.lang, workers=args.workers)
     print(json.dumps(resumo, ensure_ascii=False, indent=2))
     return 0
 
