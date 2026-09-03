@@ -10,23 +10,15 @@ from transformers import (
 
 
 # ------------------------------------------------------------
-# 3. LOAD LEGALBERT-PT FP IN 4-BIT
+# 3. LOAD LEGALBERT-PT FP
 # ------------------------------------------------------------
 
 MODEL_NAME = "raquelsilveira/legalbertpt_fp"
-
-quant_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_use_double_quant=True
-)
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
 model = AutoModelForMaskedLM.from_pretrained(
     MODEL_NAME,
-    quantization_config=quant_config,
     device_map="auto"
 )
 
