@@ -1,152 +1,698 @@
 import os
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+import pandas as pd
 
-# 1. Setup Model (Using Qwen 2.5 3B as it is fast and efficient for Portuguese)
-model_name = "Qwen/Qwen2.5-3B-Instruct"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype="auto",
+from transformers import (
+    AutoTokenizer,
+    AutoModelForMaskedLM,
+    BitsAndBytesConfig
+)
+
+
+# ------------------------------------------------------------
+# 3. LOAD LEGALBERT-PT FP IN 4-BIT
+# ------------------------------------------------------------
+
+MODEL_NAME = "raquelsilveira/legalbertpt_fp"
+
+quant_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_use_double_quant=True
+)
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+model = AutoModelForMaskedLM.from_pretrained(
+    MODEL_NAME,
+    quantization_config=quant_config,
     device_map="auto"
 )
 
-pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
+model.eval()
 
-# 2. Define the prompt for the model
-import pandas as pd
+print("Model loaded successfully.")
+print("Memory footprint:", model.get_memory_footprint(), "bytes")
+
+
+# ------------------------------------------------------------
+# 4. DEVICE
+# ------------------------------------------------------------
+
+device = next(model.parameters()).device
+
+print("Device:", device)
+
+
+# ------------------------------------------------------------
+# 5. PREDICT A CLASS USING [MASK]
+# ------------------------------------------------------------
+
+def predict_digit(text, allowed_digits):
+
+    # Tokenize
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512 # Model max input length
+    )
+
+    # Move tensors to model device
+    inputs = {
+        key: value.to(device)
+        for key, value in inputs.items()
+    }
+
+    # Find MASK
+    mask_positions = (
+        inputs["input_ids"] == tokenizer.mask_token_id
+    ).nonzero(as_tuple=True)
+
+    if len(mask_positions[0]) == 0:
+        print("ERROR: [MASK] token not found.")
+        return None
+
+    mask_position = mask_positions[1][0]
+
+    # Run model
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    # Logits corresponding to MASK
+    logits = outputs.logits[0, mask_position]
+
+    candidates = []
+
+    for digit in allowed_digits:
+
+        token_ids = tokenizer.encode(
+            digit,
+            add_special_tokens=False
+        )
+
+        # Digit must correspond to exactly one token
+        if len(token_ids) == 1:
+
+            token_id = token_ids[0]
+
+            score = logits[token_id].item()
+
+            candidates.append(
+                (digit, score)
+            )
+
+    if not candidates:
+        return None
+
+    # Highest score
+    candidates.sort(
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    return candidates[0][0]
+
+
+# ------------------------------------------------------------
+# Helper function for chunking long documents
+# ------------------------------------------------------------
+def chunk_document(text, tokenizer, max_doc_length_tokens=256, overlap=50):
+    """
+    Chunks a long text into smaller segments based on token length, with optional overlap.
+    Returns a list of decoded text chunks.
+    """
+    tokenized_input = tokenizer(text, truncation=False, add_special_tokens=False)
+    input_ids = tokenized_input["input_ids"]
+
+    chunks = []
+    start = 0
+    while start < len(input_ids):
+        end = min(start + max_doc_length_tokens, len(input_ids))
+        chunk_ids = input_ids[start:end]
+        decoded_chunk = tokenizer.decode(chunk_ids, skip_special_tokens=True)
+        if decoded_chunk.strip(): # Add only non-empty chunks
+            chunks.append(decoded_chunk)
+
+        if end == len(input_ids): # Reached the end of the input
+            break
+
+        start += max_doc_length_tokens - overlap
+        # Ensure start does not go backwards or stay the same if max_doc_length_tokens <= overlap
+        if max_doc_length_tokens - overlap <= 0 and start < len(input_ids): # Avoid infinite loop
+             start += max_doc_length_tokens # Move by full chunk size if overlap is too large
+
+    return chunks
+
+
+# ------------------------------------------------------------
+# 6. CLASSIFY ONE PROCESS
+# ------------------------------------------------------------
 
 def classify_process_text(text):
-    prompt = f"""Você é um agente especializado em analisar provas digitais em processos judiciais, comparando os procedimentos documentados nos autos com as recomendações e parâmetros da minuta do CNJ sobre provas digitais.
 
-Objetivo: analisar exclusivamente os documentos disponíveis no processo e determinar se os procedimentos relacionados às provas digitais demonstram aderência aos parâmetros da CNJ.
-Classificação obrigatória: 1 — Potencialmente Segue; 2 — Potencialmente Não Segue; 3 — Indecisivo.
-Cadeia de custódia: verifique origem, identificação, coleta/extração, data, responsável, preservação, armazenamento, transferências, acessos, cópias, análises e documentação do ciclo da evidência.
-Integridade: verifique hashes, cópias/imagens forenses, metadados, logs e outros mecanismos que permitam verificar que a evidência analisada corresponde ao material originalmente obtido.
-Autenticidade e confiabilidade: avalie origem, contexto, método de obtenção, características técnicas, possibilidade de alteração e documentação disponível.
-Método técnico: identifique ferramentas, versões, procedimentos e responsáveis pela extração ou processamento, verificando se há documentação suficiente para auditoria ou reprodução.
-Auditabilidade: verifique laudos, relatórios, arquivos, logs, hashes e demais elementos necessários para permitir a verificação independente do procedimento.
-Contraditório: verifique se existem elementos indicando que a defesa teve acesso às informações necessárias para questionar a origem, integridade, autenticidade e confiabilidade da prova.
-Inconsistências: identifique divergências entre laudos, relatórios, mídias, hashes, datas, horários, metadados ou outros documentos que possam afetar a confiabilidade da evidência.
-Não faça inferências: não considere um procedimento realizado apenas porque é usual ou tecnicamente recomendável; diferencie “não consta dos autos” de “foi demonstrado que não foi realizado”.
-Regra de decisão: classifique como 1 quando houver evidências suficientes de aderência; 2 quando houver evidência objetiva de descumprimento ou fragilidade relevante; 3 quando as informações forem insuficientes ou inconclusivas.
-Regra de cautela: a simples ausência de documentação não implica automaticamente classificação 2; quando não for possível determinar se o requisito foi cumprido ou descumprido, classifique como 3.
-Rastreabilidade: baseie a análise exclusivamente nas evidências encontradas nos autos, sem inventar informações ou utilizar fatos externos ao processo.
+    # Lists to store results from each chunk
+    all_media_digital_results = []
+    all_impugnacao_digital_results = []
+    all_classification_results = []
 
-Avaliação preliminar das mídias digitais: antes da classificação principal, verifique se existem mídias ou evidências digitais nos autos que se enquadrem no escopo das diretrizes e recomendações do CNJ para tratamento de provas digitais (tais como arquivos eletrônicos, conversas, mensagens, e-mails, registros de sistemas, mídias de armazenamento, capturas de tela, vídeos, áudios, dados extraídos de dispositivos ou serviços digitais). Registre a resposta como "Sim" ou "Não".
+    # Chunk the document
+    # Max document length for individual classification is 256 tokens.
+    # The total model max_length is 512, so prompt + document = 512.
+    # The prompt length is approx 250-260 tokens, leaving 256 for the document.
+    document_chunks = chunk_document(text, tokenizer, max_doc_length_tokens=256, overlap=50)
 
-Impugnação da prova digital: caso existam mídias digitais enquadradas no item anterior, verifique se há manifestação expressa de qualquer das partes questionando a autenticidade, integridade, origem, autoria, confiabilidade, cadeia de custódia ou veracidade dessas evidências digitais. Considere contestações apresentadas em petições, manifestações, recursos, quesitos, pareceres técnicos ou outros documentos constantes dos autos. Registre a resposta como "Sim" ou "Não". A mera discordância quanto ao mérito dos fatos não deve ser considerada impugnação da prova digital, salvo quando houver questionamento específico sobre a própria evidência ou seu processo de obtenção, preservação ou análise.
+    if not document_chunks:
+        # Handle case where no chunks could be generated (e.g., empty text)
+        print("No document chunks generated from the text. Returning None for all classifications.")
+        return None, None, None
 
-Texto do processo: {text[:2000]}
+    for i, document_chunk in enumerate(document_chunks):
+        # Skip empty chunks
+        if not document_chunk.strip():
+            continue
 
-Saída obrigatória:
-MIDIAS_DIGITAIS: Sim ou Não
-IMPUGNACAO_DA_PROVA_DIGITAL: Sim ou Não
-CLASSIFICACAO: 1, 2 ou 3"""
-    
-    messages = [{"role": "user", "content": prompt}]
-    # Increase max_new_tokens to allow for the three lines of output (Sim/Não, Sim/Não, 1/2/3)
-    result = pipe(prompt, max_new_tokens=50, num_return_sequences=1, do_sample=False)
-    generated_text = result[0]['generated_text']
-    
-    # Parse the output, initializing to None for NULL fallback
-    media_digital = None
-    impugnacao_digital = None
-    classification = None
+        # ========================================================
+        # 1. MÍDIAS DIGITAIS
+        # ========================================================
 
-    # Extract values based on the expected format
-    for line in generated_text.split('\n'):
-        if "MIDIAS_DIGITAIS:" in line:
-            media_digital = line.split("MIDIAS_DIGITAIS:")[1].strip()
-        elif "IMPUGNACAO_DA_PROVA_DIGITAL:" in line:
-            impugnacao_digital = line.split("IMPUGNACAO_DA_PROVA_DIGITAL:")[1].strip()
-        elif "CLASSIFICACAO:" in line:
-            classification = line.split("CLASSIFICACAO:")[1].strip()
+        prompt_media = f"""
+Você está analisando um processo judicial brasileiro.
 
-    return media_digital, impugnacao_digital, classification
+Determine se existem mídias ou evidências digitais nos documentos fornecidos.
+
+Exemplos:
+arquivos eletrônicos, conversas, mensagens, e-mails, registros de sistemas,
+mídias de armazenamento, capturas de tela, vídeos, áudios, dados extraídos
+de dispositivos ou serviços digitais.
+
+Não faça inferências.
+Considere exclusivamente o texto fornecido.
+
+0 = Não há evidência de mídia digital.
+1 = Há evidência de mídia digital.
+
+Texto do processo:
+
+{document_chunk}
+
+Resposta: {tokenizer.mask_token}
+"""
+
+        media_digital = predict_digit(
+            prompt_media,
+            ["0", "1"]
+        )
+        all_media_digital_results.append(media_digital)
 
 
-# 2. Folder and File Classification
-root_folder = '/content/drive/MyDrive/ocr_export'
-output_csv_path = '/content/drive/MyDrive/process_classification_results.csv'
+        # ========================================================
+        # 2. IMPUGNAÇÃO DA PROVA DIGITAL
+        # ========================================================
 
-batch_size = 10  # Define batch size
+        prompt_impugnacao = f"""
+Você está analisando um processo judicial brasileiro.
 
-# Ensure root folder exists
+Determine se alguma das partes apresentou manifestação expressamente
+questionando uma prova digital quanto à autenticidade, integridade, origem,
+autoria, confiabilidade, cadeia de custódia ou veracidade.
+
+Considere petições, manifestações, recursos, quesitos, pareceres técnicos
+ou outros documentos.
+
+A mera discordância sobre os fatos não é impugnação da prova digital.
+
+Não faça inferências.
+Considere exclusivamente o texto fornecido.
+
+0 = Não há impugnação específica de prova digital.
+1 = Há impugnação específica de prova digital.
+
+Texto do processo:
+
+{document_chunk}
+
+Resposta: {tokenizer.mask_token}
+"""
+
+        impugnacao_digital = predict_digit(
+            prompt_impugnacao,
+            ["0", "1"]
+        )
+        all_impugnacao_digital_results.append(impugnacao_digital)
+
+
+        # ========================================================
+        # 3. CLASSIFICAÇÃO PRINCIPAL
+        # ========================================================
+
+        prompt_classificacao = f"""
+Você é um especialista em provas digitais no processo judicial brasileiro.
+
+Analise exclusivamente as informações presentes no texto.
+
+Avalie:
+
+- cadeia de custódia;
+- origem e identificação da evidência;
+- coleta ou extração;
+- datas e responsáveis;
+- preservação e armazenamento;
+- transferências e acessos;
+- cópias e análises;
+- hashes e integridade;
+- imagens forenses;
+- metadados e logs;
+- autenticidade;
+- método e ferramentas utilizadas;
+- documentação;
+- auditabilidade;
+- contraditório;
+- inconsistências entre documentos.
+
+Não faça inferências.
+
+A ausência de documentação não significa automaticamente descumprimento.
+
+Diferencie:
+"não consta dos autos"
+de
+"foi demonstrado que não foi realizado".
+
+Classificação:
+
+1 = Potencialmente Segue.
+Existem evidências suficientes de aderência aos parâmetros.
+
+2 = Potencialmente Não Segue.
+Existe evidência objetiva de descumprimento ou fragilidade relevante.
+
+3 = Indecisivo.
+As informações são insuficientes ou inconclusivas.
+
+Baseie-se exclusivamente no texto fornecido.
+
+Texto do processo:
+
+{document_chunk}
+
+Classificação: {tokenizer.mask_token}
+"""
+
+        classification = predict_digit(
+            prompt_classificacao,
+            ["1", "2", "3"]
+        )
+        all_classification_results.append(classification)
+
+
+    # --- Aggregation Logic ---
+    # For binary (0/1) classifications, if any chunk is '1', the whole document is '1'.
+    final_media_digital = '0'
+    if '1' in all_media_digital_results:
+        final_media_digital = '1'
+
+    final_impugnacao_digital = '0'
+    if '1' in all_impugnacao_digital_results:
+        final_impugnacao_digital = '1'
+
+    # For 1/2/3 classification, prioritize '2' > '3' > '1'
+    final_classification = None
+    if '2' in all_classification_results:
+        final_classification = '2'
+    elif '3' in all_classification_results:
+        final_classification = '3'
+    elif '1' in all_classification_results:
+        final_classification = '1'
+    # If all were None or list was empty, it remains None
+
+    print(
+        "\n"
+        f"MIDIAS_DIGITAIS: {final_media_digital}\n"
+        f"IMPUGNACAO_DA_PROVA_DIGITAL: {final_impugnacao_digital}\n"
+        f"CLASSIFICACAO: {final_classification}\n"
+    )
+
+    return (
+        final_media_digital,
+        final_impugnacao_digital,
+        final_classification
+    )
+
+
+# ------------------------------------------------------------
+# 7. FOLDERS / OUTPUT
+# ------------------------------------------------------------
+
+root_folder = "/content/drive/MyDrive/ocr_export"
+
+output_csv_path = (
+    "/content/drive/MyDrive/"
+    "process_classification_results.csv"
+)
+
+batch_size = 10
+
+
+# ------------------------------------------------------------
+# 8. CHECK ROOT FOLDER
+# ------------------------------------------------------------
+
 if not os.path.exists(root_folder):
-    print(f"Root folder {root_folder} not found. Please ensure it exists and contains process folders.")
+
+    print(
+        f"ERROR: Folder not found:\n{root_folder}"
+    )
+
 else:
-    # Load existing results if the CSV already exists
+
+    # --------------------------------------------------------
+    # LOAD EXISTING RESULTS
+    # --------------------------------------------------------
+
     existing_results_df = pd.DataFrame()
+
     if os.path.exists(output_csv_path):
-        existing_results_df = pd.read_csv(output_csv_path)
-        print(f"Loaded {len(existing_results_df)} existing results from {output_csv_path}")
 
-    processed_ids = set(existing_results_df['Process ID'].tolist()) if not existing_results_df.empty else set()
+        existing_results_df = pd.read_csv(
+            output_csv_path
+        )
 
-    all_process_folders = [f for f in os.listdir(root_folder) if os.path.isdir(os.path.join(root_folder, f))]
-    unprocessed_folders = [f for f in all_process_folders if f not in processed_ids]
-    
-    print(f"Found {len(all_process_folders)} total process folders. {len(unprocessed_folders)} are new/unprocessed.")
+        print(
+            f"Loaded "
+            f"{len(existing_results_df)} "
+            f"existing results."
+        )
 
-    for i in range(0, len(unprocessed_folders), batch_size):
-        batch_folders = unprocessed_folders[i:i + batch_size]
+
+    # --------------------------------------------------------
+    # PROCESSED IDS
+    # --------------------------------------------------------
+
+    if (
+        not existing_results_df.empty
+        and "Process ID" in existing_results_df.columns
+    ):
+
+        processed_ids = set(
+            existing_results_df["Process ID"]
+            .astype(str)
+            .tolist()
+        )
+
+    else:
+
+        processed_ids = set()
+
+
+    # --------------------------------------------------------
+    # FIND PROCESS FOLDERS
+    # --------------------------------------------------------
+
+    all_process_folders = [
+        folder
+        for folder in os.listdir(root_folder)
+        if os.path.isdir(
+            os.path.join(root_folder, folder)
+        )
+    ]
+
+    unprocessed_folders = [
+        folder
+        for folder in all_process_folders
+        if folder not in processed_ids
+    ]
+
+
+    print(
+        f"Found {len(all_process_folders)} "
+        f"total process folders."
+    )
+
+    print(
+        f"{len(unprocessed_folders)} "
+        f"are new/unprocessed."
+    )
+
+
+    # ========================================================
+    # 9. PROCESS BATCHES
+    # ========================================================
+
+    for i in range(
+        0,
+        len(unprocessed_folders),
+        batch_size
+    ):
+
+        batch_folders = unprocessed_folders[
+            i:i + batch_size
+        ]
+
         batch_results = []
-        
-        print(f"\nProcessing batch {i//batch_size + 1}/{len(unprocessed_folders)//batch_size + 1} (Folders {i+1}-{min(i+batch_size, len(unprocessed_folders))})")
+
+        batch_number = (
+            i // batch_size
+        ) + 1
+
+        total_batches = (
+            len(unprocessed_folders)
+            + batch_size
+            - 1
+        ) // batch_size
+
+        print(
+            "\n"
+            f"====================================\n"
+            f"BATCH {batch_number}/{total_batches}\n"
+            f"===================================="
+        )
+
+
+        # ----------------------------------------------------
+        # PROCESS EACH FOLDER
+        # ----------------------------------------------------
 
         for process_folder_name in batch_folders:
-            process_folder_path = os.path.join(root_folder, process_folder_name)
-            
+
+            process_folder_path = os.path.join(
+                root_folder,
+                process_folder_name
+            )
+
+            print(
+                f"\nProcessing: "
+                f"{process_folder_name}"
+            )
+
+
+            # ------------------------------------------------
+            # READ TXT FILES
+            # ------------------------------------------------
+
             combined_text = []
-            # Read all .txt files in the process folder
-            for file_name in os.listdir(process_folder_path):
-                if file_name.endswith('.txt'):
-                    file_path = os.path.join(process_folder_path, file_name)
+
+            for file_name in os.listdir(
+                process_folder_path
+            ):
+
+                if file_name.lower().endswith(".txt"):
+
+                    file_path = os.path.join(
+                        process_folder_path,
+                        file_name
+                    )
+
                     try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            combined_text.append(f.read())
+
+                        with open(
+                            file_path,
+                            "r",
+                            encoding="utf-8"
+                        ) as f:
+
+                            combined_text.append(
+                                f.read()
+                            )
+
                     except Exception as e:
-                        print(f"Error reading file {file_path}: {e}")
-            
-            full_process_text = "\n".join(combined_text)
-            
-            if full_process_text:
-                media_digital, impugnacao_digital, classification = classify_process_text(full_process_text)
+
+                        print(
+                            f"Error reading "
+                            f"{file_path}: {e}"
+                        )
+
+
+            full_process_text = "\n".join(
+                combined_text
+            )
+
+
+            # ------------------------------------------------
+            # CLASSIFY
+            # ------------------------------------------------
+
+            if full_process_text.strip():
+
+                try:
+
+                    (
+                        media_digital,
+                        impugnacao_digital,
+                        classification
+                    ) = classify_process_text(
+                        full_process_text
+                    )
+
+                except Exception as e:
+
+                    print(
+                        f"ERROR processing "
+                        f"{process_folder_name}: {e}"
+                    )
+
+                    media_digital = None
+                    impugnacao_digital = None
+                    classification = None
+
+
                 batch_results.append({
-                    "Process ID": process_folder_name,
-                    "MIDIAS_DIGITAIS": media_digital,
-                    "IMPUGNACAO_DA_PROVA_DIGITAL": impugnacao_digital,
-                    "CLASSIFICACAO": classification
+
+                    "Process ID":
+                        process_folder_name,
+
+                    "MIDIAS_DIGITAIS":
+                        media_digital,
+
+                    "IMPUGNACAO_DA_PROVA_DIGITAL":
+                        impugnacao_digital,
+
+                    "CLASSIFICACAO":
+                        classification
                 })
-                print(f"  Process: {process_folder_name} | MIDIAS_DIGITAIS: {media_digital} | IMPUGNACAO_DA_PROVA_DIGITAL: {impugnacao_digital} | CLASSIFICACAO: {classification}")
+
+
+                print(
+                    f"RESULT: "
+                    f"{media_digital} | "
+                    f"{impugnacao_digital} | "
+                    f"{classification}"
+                )
+
+
+            # ------------------------------------------------
+            # EMPTY PROCESS
+            # ------------------------------------------------
+
             else:
-                # If no text, set all values to None
+
                 batch_results.append({
-                    "Process ID": process_folder_name,
-                    "MIDIAS_DIGITAIS": None,
-                    "IMPUGNACAO_DA_PROVA_DIGITAL": None,
-                    "CLASSIFICACAO": None
-                }) 
-                print(f"  Process {process_folder_name} has no content to classify. Values set to NULL.")
 
-        # Append batch results to CSV
+                    "Process ID":
+                        process_folder_name,
+
+                    "MIDIAS_DIGITAIS":
+                        None,
+
+                    "IMPUGNACAO_DA_PROVA_DIGITAL":
+                        None,
+
+                    "CLASSIFICACAO":
+                        None
+                })
+
+                print(
+                    "No text found. "
+                    "Values set to NULL."
+                )
+
+
+        # ====================================================
+        # 10. SAVE BATCH
+        # ====================================================
+
         if batch_results:
-            batch_df = pd.DataFrame(batch_results)
-            if not os.path.exists(output_csv_path) or existing_results_df.empty:
-                # If CSV doesn't exist or was empty, write with header
-                batch_df.to_csv(output_csv_path, index=False, mode='w')
-            else:
-                # If CSV exists and had data, append without header
-                batch_df.to_csv(output_csv_path, index=False, mode='a', header=False)
-            print(f"  Batch results saved/appended to {output_csv_path}")
-        else:
-            print("  No new results in this batch to save.")
 
-    print("\nAll specified process folders have been processed.")
-    # Final check and display
-    if os.path.exists(output_csv_path):
-        final_df = pd.read_csv(output_csv_path)
-        print(f"Total unique classified processes: {len(final_df['Process ID'].unique())}")
+            batch_df = pd.DataFrame(
+                batch_results
+            )
+
+            file_exists = os.path.exists(
+                output_csv_path
+            )
+
+            if not file_exists:
+
+                batch_df.to_csv(
+                    output_csv_path,
+                    index=False,
+                    mode="w"
+                )
+
+            else:
+
+                batch_df.to_csv(
+                    output_csv_path,
+                    index=False,
+                    mode="a",
+                    header=False
+                )
+
+            print(
+                f"\nBatch saved to:\n"
+                f"{output_csv_path}"
+            )
+
+
+    # ========================================================
+    # 11. FINAL RESULT
+    # ========================================================
+
+    if os.path.exists(
+        output_csv_path
+    ):
+
+        final_df = pd.read_csv(
+            output_csv_path
+        )
+
+        print(
+            "\n===================================="
+        )
+
+        print(
+            "PROCESSING COMPLETE"
+        )
+
+        print(
+            f"Total rows: {len(final_df)}"
+        )
+
+        print(
+            "Unique processes:",
+            final_df["Process ID"].nunique()
+        )
+
+        print(
+            "\nClassification counts:"
+        )
+
+        print(
+            final_df["CLASSIFICACAO"]
+            .value_counts(dropna=False)
+        )
+
+        print(
+            "\nCSV:"
+        )
+
+        print(
+            output_csv_path
+        )
+
     else:
-        print("No CSV file generated as no processes were classified.")
+
+        print(
+            "No CSV generated."
+        )
