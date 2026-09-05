@@ -1,28 +1,18 @@
 """
-Coleta de processos de BPC/LOAS na API Pública do DataJud (CNJ).
+Coleta de processos de na API Pública do DataJud (CNJ).
 
 A API Pública do DataJud (https://datajud-wiki.cnj.jus.br/api-publica/) expõe
 metadados processuais de todos os tribunais brasileiros em índices
-Elasticsearch. Este módulo consulta os cinco Tribunais Regionais Federais
-(TRF1–TRF5, incluindo os Juizados Especiais Federais, grau "JE") e extrai os
-processos cujo assunto, na Tabela Processual Unificada (TPU/SGT) do CNJ,
-corresponde ao Benefício de Prestação Continuada:
-
-    6114  — Benefício Assistencial (Art. 203,V CF/88)   [código-pai]
-    11946 — Deficiente                                   [filho de 6114]
-    11947 — Idoso                                        [filho de 6114]
-
-Os códigos-filhos foram identificados empiricamente por agregação de termos
-sobre o índice público (a maioria dos registros traz apenas o código do
-assunto, sem o nome).
+Elasticsearch. Este módulo consulta os cinco Tribunais Regionais Federais e extrai os
+processo.
 
 Conformidade com a LGPD: a API pública do DataJud não expõe nomes de partes
 nem documentos pessoais — apenas metadados processuais (classe, assunto,
 órgão julgador, movimentos). Nenhum dado pessoal é coletado por este script.
 
 Uso:
-    python src/coleta_datajud.py --tribunais trf1 trf2 trf3 trf4 trf5 \
-        --max-por-tribunal 500 --saida dados/
+    python src/coleta_datajud.py --tribunais tjsp \
+        --max-por-tribunal 2000 --saida dados/
 
 Saída: um arquivo JSONL (um processo por linha) por tribunal.
 """
@@ -44,20 +34,15 @@ API_KEY = "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw=="
 
 BASE_URL = "https://api-publica.datajud.cnj.jus.br/api_publica_{tribunal}/_search"
 
-# Assuntos TPU/SGT que identificam o BPC/LOAS (ver docstring).
-ASSUNTOS_BPC = [6114, 11946, 11947]
-
-TAMANHO_PAGINA = 100          # máximo aceito pela API é 10.000; 100 é cortês
+TAMANHO_PAGINA = 100           # máximo aceito pela API é 10.000; 100 é cortês
 PAUSA_ENTRE_REQUISICOES = 0.3  # segundos
 MAX_TENTATIVAS = 4
-
 
 def consulta_base(depois_de: list | None = None) -> dict:
     """Monta o corpo da consulta Elasticsearch com paginação via search_after."""
     corpo: dict = {
         "size": TAMANHO_PAGINA,
         "track_total_hits": True,
-        "query": {"terms": {"assuntos.codigo": ASSUNTOS_BPC}},
         "sort": [{"@timestamp": {"order": "asc"}}],
     }
     if depois_de is not None:
@@ -95,7 +80,7 @@ def requisita(url: str, corpo: dict) -> dict:
 def coleta_tribunal(tribunal: str, max_processos: int, pasta_saida: Path) -> int:
     """Coleta processos de um tribunal e grava em JSONL. Retorna o total gravado."""
     url = BASE_URL.format(tribunal=tribunal)
-    arquivo = pasta_saida / f"bpc_{tribunal}.jsonl"
+    arquivo = pasta_saida / f"{tribunal}.jsonl"
     gravados = 0
     depois_de: list | None = None
 
@@ -107,7 +92,7 @@ def coleta_tribunal(tribunal: str, max_processos: int, pasta_saida: Path) -> int
                 break
             if depois_de is None:  # primeira página: informa o universo total
                 total = dados["hits"]["total"]["value"]
-                print(f"[{tribunal.upper()}] universo BPC no índice: {total:,} processos")
+                print(f"[{tribunal.upper()}]: {total:,} processos")
             for acerto in acertos:
                 saida.write(json.dumps(acerto["_source"], ensure_ascii=False) + "\n")
                 gravados += 1
@@ -125,7 +110,7 @@ def principal() -> None:
     analisador.add_argument(
         "--tribunais", nargs="+",
         default=["trf1", "trf2", "trf3", "trf4", "trf5"],
-        choices=["trf1", "trf2", "trf3", "trf4", "trf5"],
+        choices=["trf1", "trf2", "trf3", "trf4", "trf5", "tjsp"],
         help="Tribunais a consultar (padrão: TRF1 a TRF5).",
     )
     analisador.add_argument(

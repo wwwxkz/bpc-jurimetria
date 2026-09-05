@@ -1,4 +1,4 @@
-"""Consulta processos do BPC e baixa pecas publicas em uma unica etapa."""
+"""Consulta processos e baixa pecas publicas em uma unica etapa."""
 
 from __future__ import annotations
 
